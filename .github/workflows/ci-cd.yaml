@@ -1,0 +1,473 @@
+name: React CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+  packages: write
+
+env:
+  NODE_VERSION: "22"
+  IMAGE_NAME: my-react-app
+
+jobs:
+
+  # ============================================================
+  # 1. INSTALL + LINT + TEST + BUILD
+  # ============================================================
+  test:
+    name: Test React Application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: |
+          node --version
+          npm --version
+          npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run unit/component tests
+        run: npm run test:ci
+
+      - name: Build React application
+        run: npm run build
+
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: warn
+
+      - name: Upload React build
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-build
+          path: dist/
+          if-no-files-found: error
+
+
+  # ============================================================
+  # 2. SONARQUBE CODE QUALITY
+  # ============================================================
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download test coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+
+      - name: Check SonarQube connectivity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking SonarQube: ${{ secrets.SONAR_HOST_URL }}"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${{ secrets.SONAR_HOST_URL }}/api/system/status"
+
+          echo "SonarQube is reachable and operational"
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v8.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+
+  # ============================================================
+  # 3. TRIVY FILESYSTEM / DEPENDENCY SCAN
+  # ============================================================
+  trivy-fs:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Get date for Trivy DB cache key
+        id: trivy-date
+        shell: bash
+        run: echo "date=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ steps.trivy-date.outputs.date }}
+          restore-keys: |
+            trivy-db-
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+
+
+  # ============================================================
+  # 4. BUILD DOCKER IMAGE
+  # ============================================================
+  docker-build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - sonarqube
+      - trivy-fs
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+      - name: Save Docker image
+        run: |
+          docker save \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -o docker-image.tar
+
+      - name: Upload Docker image
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: docker-image.tar
+          retention-days: 1
+
+
+  # ============================================================
+  # 5. TRIVY DOCKER IMAGE SCAN
+  # ============================================================
+  trivy-image:
+    name: Trivy Docker Image Scan
+    runs-on: ubuntu-latest
+    needs: docker-build
+
+    steps:
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: .
+
+      - name: Load Docker image
+        run: docker load --input docker-image.tar
+
+      - name: Get date for Trivy DB cache key
+        id: trivy-date
+        shell: bash
+        run: echo "date=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ steps.trivy-date.outputs.date }}
+          restore-keys: |
+            trivy-db-
+
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+
+
+  # ============================================================
+  # 6. PUSH DOCKER IMAGE TO NEXUS REPOSITORY
+  # ============================================================
+  nexus-docker-push:
+    name: Push Docker Image to Nexus
+    runs-on: ubuntu-latest
+    needs: trivy-image
+
+    if: github.event_name != 'pull_request'
+
+    env:
+      NEXUS_REGISTRY: ${{ secrets.NEXUS_REGISTRY }}
+      NEXUS_DOCKER_REPOSITORY: ${{ secrets.NEXUS_DOCKER_REPOSITORY }}
+      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+    steps:
+      - name: Download scanned Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: .
+
+      - name: Load Docker image
+        run: |
+          set -euo pipefail
+          docker load --input docker-image.tar
+
+      - name: Verify Nexus configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -n "$NEXUS_REGISTRY" || {
+            echo "::error::NEXUS_REGISTRY secret is empty or unavailable."
+            exit 1
+          }
+
+          test -n "$NEXUS_DOCKER_REPOSITORY" || {
+            echo "::error::NEXUS_DOCKER_REPOSITORY secret is empty or unavailable."
+            exit 1
+          }
+
+          test -n "$NEXUS_USERNAME" || {
+            echo "::error::NEXUS_USERNAME secret is empty or unavailable."
+            exit 1
+          }
+
+          test -n "$NEXUS_PASSWORD" || {
+            echo "::error::NEXUS_PASSWORD secret is empty or unavailable."
+            exit 1
+          }
+
+          case "$NEXUS_REGISTRY" in
+            http://*|https://*)
+              echo "::error::NEXUS_REGISTRY must contain only host:port, for example 169.58.184.121:8082. Do not include http:// or https://."
+              exit 1
+              ;;
+          esac
+
+          case "$NEXUS_REGISTRY" in
+            */*)
+              echo "::error::NEXUS_REGISTRY must not contain a repository path. Use only host:port."
+              exit 1
+              ;;
+          esac
+
+          echo "Nexus registry: $NEXUS_REGISTRY"
+          echo "Nexus Docker repository: $NEXUS_DOCKER_REPOSITORY"
+
+      - name: Test Nexus Registry Connectivity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Testing HTTP connectivity to Nexus..."
+
+          HTTP_CODE="$(
+            curl \
+              --silent \
+              --show-error \
+              --output /dev/null \
+              --write-out "%{http_code}" \
+              --connect-timeout 10 \
+              --max-time 30 \
+              "http://${NEXUS_REGISTRY}/v2/"
+          )"
+
+          echo "Nexus /v2/ HTTP status: $HTTP_CODE"
+
+          case "$HTTP_CODE" in
+            200|401)
+              echo "Nexus Docker Registry is reachable."
+              ;;
+            *)
+              echo "::error::Nexus Docker Registry returned HTTP $HTTP_CODE."
+              exit 1
+              ;;
+          esac
+
+      - name: Login to Nexus Docker Registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "$NEXUS_PASSWORD" | \
+            docker login "$NEXUS_REGISTRY" \
+              --username "$NEXUS_USERNAME" \
+              --password-stdin
+
+      - name: Verify Docker image
+        run: |
+          set -euo pipefail
+          docker image inspect "${IMAGE_NAME}:${{ github.sha }}"
+
+      - name: Tag Docker image
+        run: |
+          set -euo pipefail
+
+          docker tag \
+            "${IMAGE_NAME}:${{ github.sha }}" \
+            "${NEXUS_REGISTRY}/${NEXUS_DOCKER_REPOSITORY}/${IMAGE_NAME}:${{ github.sha }}"
+
+          docker tag \
+            "${IMAGE_NAME}:${{ github.sha }}" \
+            "${NEXUS_REGISTRY}/${NEXUS_DOCKER_REPOSITORY}/${IMAGE_NAME}:latest"
+
+      - name: Push SHA image to Nexus
+        run: |
+          set -euo pipefail
+
+          docker push \
+            "${NEXUS_REGISTRY}/${NEXUS_DOCKER_REPOSITORY}/${IMAGE_NAME}:${{ github.sha }}"
+
+      - name: Push latest image to Nexus
+        run: |
+          set -euo pipefail
+
+          docker push \
+            "${NEXUS_REGISTRY}/${NEXUS_DOCKER_REPOSITORY}/${IMAGE_NAME}:latest"
+
+
+  # ============================================================
+  # 7. DEPLOY TO VPS
+  # ============================================================
+  deploy-vps:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: nexus-docker-push
+
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Validate Nexus configuration
+        shell: bash
+        env:
+          NEXUS_REGISTRY: ${{ secrets.NEXUS_REGISTRY }}
+          NEXUS_DOCKER_REPOSITORY: ${{ secrets.NEXUS_DOCKER_REPOSITORY }}
+        run: |
+          set -euo pipefail
+
+          test -n "$NEXUS_REGISTRY" || {
+            echo "::error::NEXUS_REGISTRY secret is empty or unavailable."
+            exit 1
+          }
+
+          test -n "$NEXUS_DOCKER_REPOSITORY" || {
+            echo "::error::NEXUS_DOCKER_REPOSITORY secret is empty or unavailable."
+            exit 1
+          }
+
+          case "$NEXUS_REGISTRY" in
+            http://*|https://*|*/*)
+              echo "::error::NEXUS_REGISTRY must be host:port only, for example 169.58.184.121:8082."
+              exit 1
+              ;;
+          esac
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+
+            REGISTRY="${{ secrets.NEXUS_REGISTRY }}"
+            REPOSITORY="${{ secrets.NEXUS_DOCKER_REPOSITORY }}"
+            IMAGE_NAME="${{ env.IMAGE_NAME }}"
+            IMAGE="${REGISTRY}/${REPOSITORY}/${IMAGE_NAME}:${{ github.sha }}"
+
+            echo "Connected to VPS"
+            whoami
+            hostname
+
+            echo "Testing Nexus Registry..."
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              "http://${REGISTRY}/v2/" \
+              > /dev/null
+
+            echo "Logging into Nexus..."
+            echo "${{ secrets.NEXUS_PASSWORD }}" | \
+              docker login "${REGISTRY}" \
+                --username "${{ secrets.NEXUS_USERNAME }}" \
+                --password-stdin
+
+            echo "Pulling image from Nexus..."
+            docker pull "${IMAGE}"
+
+            echo "Removing old container..."
+            docker stop "${IMAGE_NAME}" || true
+            docker rm "${IMAGE_NAME}" || true
+
+            echo "Starting new container..."
+            docker run -d \
+              --name "${IMAGE_NAME}" \
+              --restart unless-stopped \
+              -p 9999:80 \
+              "${IMAGE}"
+
+            echo "Testing application..."
+            sleep 5
+
+            curl \
+              --fail \
+              --connect-timeout 10 \
+              --max-time 30 \
+              http://localhost:9999
+
+            echo "Deployment completed successfully"
