@@ -9,7 +9,8 @@
   "main": "dist-electron/main/index.js",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && electron-builder",
+    "build": "npm run build:web && electron-builder",
+    "build:web": "vite build",
     "preview": "vite preview",
     "pretest": "vite build --mode=test",
     "test": "vitest run",
@@ -29,6 +30,7 @@
     "@vitest/coverage-v8": "^4.1.11",
     "electron": "^42.1.0",
     "electron-builder": "^26.8.1",
+    "electron-vite": "^5.0.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "tailwindcss": "^4.3.0",
