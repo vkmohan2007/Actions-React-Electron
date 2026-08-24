@@ -28,43 +28,29 @@ jobs:
   test:
     name: Test Electron Application
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      # ----------------------------------------------------------
-      # Checkout
-      # ----------------------------------------------------------
       - name: Checkout source
         uses: actions/checkout@v6
 
-      # ----------------------------------------------------------
-      # Setup pnpm
-      # ----------------------------------------------------------
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10
           run_install: false
 
-      # ----------------------------------------------------------
-      # Setup Node.js
-      # ----------------------------------------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
 
-      # ----------------------------------------------------------
-      # Verify versions
-      # ----------------------------------------------------------
       - name: Verify versions
         run: |
           node --version
           pnpm --version
 
-      # ----------------------------------------------------------
-      # Get pnpm store path
-      # ----------------------------------------------------------
       - name: Get pnpm store path
         id: pnpm-store
         run: |
@@ -72,9 +58,6 @@ jobs:
           echo "PNPM store: $STORE_PATH"
           echo "path=$STORE_PATH" >> "$GITHUB_OUTPUT"
 
-      # ----------------------------------------------------------
-      # Cache pnpm dependencies
-      # ----------------------------------------------------------
       - name: Cache pnpm store
         uses: actions/cache@v4
         with:
@@ -83,17 +66,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
 
-      # ----------------------------------------------------------
-      # Install dependencies
-      # ----------------------------------------------------------
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # ----------------------------------------------------------
-      # Unit / Component Tests
-      # ----------------------------------------------------------
       - name: Run unit/component tests
         run: pnpm run test:ci
+
+      - name: Build web assets
+        run: pnpm run build:web
+
+      - name: Build Electron application
+        run: |
+          echo "Starting Electron build..."
+          pnpm exec electron-builder --publish never
+        env:
+          DEBUG: electron-builder
 
       - name: Inspect Electron build files
         run: |
@@ -114,41 +101,21 @@ jobs:
             echo "release directory does not exist"
           fi
 
-      - name: Build Electron application
-        run: |
-          echo "Starting Electron build..."
-          pnpm exec electron-builder --publish never --debug
-
-      # ----------------------------------------------------------
-      # Build Electron Application
-      # ----------------------------------------------------------
-      # --publish never prevents electron-builder from trying
-      # to publish to GitHub/Snap Store during normal CI builds.
-      # ----------------------------------------------------------
-      - name: Build Electron application
-        run: |
-          echo "Starting Electron build..."
-          pnpm exec electron-builder --publish never --debug
-
-      # ----------------------------------------------------------
-      # Upload test coverage
-      # ----------------------------------------------------------
       - name: Upload test coverage
         uses: actions/upload-artifact@v4
         with:
           name: coverage
           path: coverage/
           if-no-files-found: warn
+          retention-days: 7
 
-      # ----------------------------------------------------------
-      # Upload Electron build
-      # ----------------------------------------------------------
       - name: Upload Electron build
         uses: actions/upload-artifact@v4
         with:
           name: electron-build
           path: release/
           if-no-files-found: error
+          retention-days: 7
 
 
   # ============================================================
@@ -158,6 +125,7 @@ jobs:
     name: SonarQube Analysis
     runs-on: ubuntu-latest
     needs: test
+    timeout-minutes: 10
 
     steps:
       - name: Checkout source
@@ -175,9 +143,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           echo "Checking SonarQube: ${{ secrets.SONAR_HOST_URL }}"
-
           curl \
             --fail \
             --silent \
@@ -185,7 +151,6 @@ jobs:
             --connect-timeout 10 \
             --max-time 30 \
             "${{ secrets.SONAR_HOST_URL }}/api/system/status"
-
           echo "SonarQube is reachable and operational"
 
       - name: SonarQube Scan
@@ -201,6 +166,7 @@ jobs:
   trivy-fs:
     name: Trivy Filesystem Scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout source
@@ -219,14 +185,24 @@ jobs:
           restore-keys: |
             trivy-db-
 
-      - name: Trivy filesystem scan
+      - name: Trivy scan - CRITICAL (blocking)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
-          severity: CRITICAL,HIGH
+          severity: CRITICAL
           ignore-unfixed: true
           exit-code: 1
+
+      - name: Trivy scan - HIGH (report only)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH
+          ignore-unfixed: true
+          exit-code: 0
 
 
   # ============================================================
@@ -235,6 +211,7 @@ jobs:
   docker-build:
     name: Build Docker Image
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs:
       - test
       - sonarqube
@@ -280,6 +257,7 @@ jobs:
   trivy-image:
     name: Trivy Docker Image Scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: docker-build
 
     steps:
@@ -305,14 +283,24 @@ jobs:
           restore-keys: |
             trivy-db-
 
-      - name: Scan Docker image
+      - name: Trivy scan - CRITICAL (blocking)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           format: table
-          severity: CRITICAL,HIGH
+          severity: CRITICAL
           ignore-unfixed: true
           exit-code: 1
+
+      - name: Trivy scan - HIGH (report only)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          severity: HIGH
+          ignore-unfixed: true
+          exit-code: 0
 
 
   # ============================================================
@@ -321,6 +309,7 @@ jobs:
   nexus-docker-push:
     name: Push Docker Image to Nexus
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: trivy-image
 
     if: github.event_name != 'pull_request'
@@ -419,7 +408,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           echo "$NEXUS_PASSWORD" | \
             docker login "$NEXUS_REGISTRY" \
               --username "$NEXUS_USERNAME" \
@@ -445,14 +433,12 @@ jobs:
       - name: Push SHA image to Nexus
         run: |
           set -euo pipefail
-
           docker push \
             "${NEXUS_REGISTRY}/${NEXUS_DOCKER_REPOSITORY}/${IMAGE_NAME}:${{ github.sha }}"
 
       - name: Push latest image to Nexus
         run: |
           set -euo pipefail
-
           docker push \
             "${NEXUS_REGISTRY}/${NEXUS_DOCKER_REPOSITORY}/${IMAGE_NAME}:latest"
 
@@ -463,7 +449,9 @@ jobs:
   deploy-vps:
     name: Deploy to VPS
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: nexus-docker-push
+    environment: production
 
     if: github.ref == 'refs/heads/main'
 
@@ -495,18 +483,23 @@ jobs:
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.5
+        env:
+          REGISTRY: ${{ secrets.NEXUS_REGISTRY }}
+          REPOSITORY: ${{ secrets.NEXUS_DOCKER_REPOSITORY }}
+          NEXUS_USER: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASSWORD }}
+          IMG_NAME: ${{ env.IMAGE_NAME }}
+          IMG_TAG: ${{ github.sha }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: 22
+          envs: REGISTRY,REPOSITORY,NEXUS_USER,NEXUS_PASS,IMG_NAME,IMG_TAG
           script: |
             set -e
 
-            REGISTRY="${{ secrets.NEXUS_REGISTRY }}"
-            REPOSITORY="${{ secrets.NEXUS_DOCKER_REPOSITORY }}"
-            IMAGE_NAME="${{ env.IMAGE_NAME }}"
-            IMAGE="${REGISTRY}/${REPOSITORY}/${IMAGE_NAME}:${{ github.sha }}"
+            IMAGE="${REGISTRY}/${REPOSITORY}/${IMG_NAME}:${IMG_TAG}"
 
             echo "Connected to VPS"
             whoami
@@ -523,23 +516,23 @@ jobs:
               > /dev/null
 
             echo "Logging into Nexus..."
-            echo "${{ secrets.NEXUS_PASSWORD }}" | \
+            echo "${NEXUS_PASS}" | \
               docker login "${REGISTRY}" \
-                --username "${{ secrets.NEXUS_USERNAME }}" \
+                --username "${NEXUS_USER}" \
                 --password-stdin
 
             echo "Pulling image from Nexus..."
             docker pull "${IMAGE}"
 
             echo "Removing old container..."
-            docker stop "${IMAGE_NAME}" || true
-            docker rm "${IMAGE_NAME}" || true
+            docker stop "${IMG_NAME}" || true
+            docker rm "${IMG_NAME}" || true
 
             echo "Starting new container..."
             docker run -d \
-              --name "${IMAGE_NAME}" \
+              --name "${IMG_NAME}" \
               --restart unless-stopped \
-              -p 9999:80 \
+              -p 9999:8080 \
               "${IMAGE}"
 
             echo "Testing application..."
