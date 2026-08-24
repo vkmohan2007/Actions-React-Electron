@@ -515,14 +515,28 @@ jobs:
             hostname
 
             echo "Testing Nexus Registry..."
-            curl \
-              --fail \
-              --silent \
-              --show-error \
-              --connect-timeout 10 \
-              --max-time 30 \
-              "http://${REGISTRY}/v2/" \
-              > /dev/null
+            HTTP_CODE="$(
+              curl \
+                --silent \
+                --show-error \
+                --output /dev/null \
+                --write-out "%{http_code}" \
+                --connect-timeout 10 \
+                --max-time 30 \
+                "http://${REGISTRY}/v2/"
+            )"
+
+            echo "Nexus /v2/ HTTP status: $HTTP_CODE"
+
+            case "$HTTP_CODE" in
+              200|401)
+                echo "Nexus Docker Registry is reachable."
+                ;;
+              *)
+                echo "Nexus Docker Registry returned HTTP $HTTP_CODE"
+                exit 1
+                ;;
+            esac
 
             echo "Logging into Nexus..."
             echo "${NEXUS_PASS}" | \
