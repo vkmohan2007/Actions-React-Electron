@@ -5,6 +5,8 @@ FROM node:22.12-alpine AS builder
 
 WORKDIR /app
 
+ENV COREPACK_INTEGRITY_KEYS=0
+
 RUN corepack enable && corepack prepare pnpm@10.7.0 --activate
 
 ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
