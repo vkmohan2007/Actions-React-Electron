@@ -95,6 +95,30 @@ jobs:
       - name: Run unit/component tests
         run: pnpm run test:ci
 
+      - name: Inspect Electron build files
+        run: |
+          echo "=== Project root ==="
+          ls -la
+
+          echo "=== dist ==="
+          if [ -d dist ]; then
+            find dist -maxdepth 3 -type f | sort
+          else
+            echo "dist directory does not exist"
+          fi
+
+          echo "=== release ==="
+          if [ -d release ]; then
+            find release -maxdepth 3 -type f | sort
+          else
+            echo "release directory does not exist"
+          fi
+
+      - name: Build Electron application
+        run: |
+          echo "Starting Electron build..."
+          pnpm exec electron-builder --publish never --debug
+
       # ----------------------------------------------------------
       # Build Electron Application
       # ----------------------------------------------------------
@@ -102,7 +126,9 @@ jobs:
       # to publish to GitHub/Snap Store during normal CI builds.
       # ----------------------------------------------------------
       - name: Build Electron application
-        run: pnpm exec electron-builder --publish never
+        run: |
+          echo "Starting Electron build..."
+          pnpm exec electron-builder --publish never --debug
 
       # ----------------------------------------------------------
       # Upload test coverage
