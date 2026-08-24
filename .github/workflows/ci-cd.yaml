@@ -332,6 +332,15 @@ jobs:
           set -euo pipefail
           docker load --input docker-image.tar
 
+      - name: Configure Docker for insecure Nexus registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "{\"insecure-registries\":[\"${NEXUS_REGISTRY}\"]}" | \
+            sudo tee /etc/docker/daemon.json > /dev/null
+          sudo systemctl restart docker
+          echo "Configured insecure registry: $NEXUS_REGISTRY"
+
       - name: Verify Nexus configuration
         shell: bash
         run: |
